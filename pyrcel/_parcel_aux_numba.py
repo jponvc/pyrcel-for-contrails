@@ -62,7 +62,6 @@ def Seq(r, r_dry, T, kappa):
         B = (r**3 - (r_dry**3)) / (r**3 - (r_dry**3) * (1.0 - kappa))
     return np.exp(A) * B - 1.0
 
-
 ## RHS Derivative callback function
 @nb.njit(parallel=True)
 @auxcc.export("parcel_ode_sys", "f8[:](f8[:], f8, i4, f8[:], f8[:], f8, f8[:], f8)")
@@ -95,8 +94,12 @@ def parcel_ode_sys(y, t, nr, r_drys, Nis, V, kappas, accom):
         Array recording original aerosol dry radii, m.
     Nis : array_like
         Array recording aerosol number concentrations, 1/(m**3).
-    V : float
-        Updraft velocity, m/s.
+    V : array containing variables:
+        T_a : ambient temperature, in Kelvin
+        P0 : total atmospheric pressure, in Pa
+        RHi : ambient ice saturation ratio
+        G : gradient of the contrail mixing line (see B Kärcher et al., 2015), in Pa/K
+        T_e: exhaust temperature, in Kelvin
     kappas : array_like
         Array recording aerosol hygroscopicities.
     accom : float, optional (default=:const:`constants.ac`)
@@ -122,13 +125,26 @@ def parcel_ode_sys(y, t, nr, r_drys, Nis, V, kappas, accom):
     wc = y[4]
     wi = y[5]
     S = y[6]
-    rs = y[N_STATE_VARS:]
+    rs = y[N_STATE_VARS:N_STATE_VARS+nr]
 
     T_c = T - 273.15  # convert temperature to Celsius
     pv_sat = es(T_c)  # saturation vapor pressure
-    wv_sat = wv / (S + 1.0)  # saturation mixing ratio
     Tv = (1.0 + 0.61 * wv) * T
     e = (1.0 + S) * pv_sat  # water vapor pressure
+
+    def p_i_0(T): 
+        """Calculates the saturation vapour pressure above a flat surface of ice.
+
+        Parameters
+        ----------
+        T : array_like
+
+        Returns
+        -------
+        x : array_like
+            Saturation vapour pressure above a flat surface of ice according to Murphy and Koop, 2005
+        """   
+        return np.exp(9.550426 - 5723.265/T + 3.53068 * np.log(T) - 0.00728332*T) 
 
     ## Compute air densities from current state
     rho_air = P / c.Rd / Tv
@@ -136,10 +152,35 @@ def parcel_ode_sys(y, t, nr, r_drys, Nis, V, kappas, accom):
     rho_air_dry = (P - e) / c.Rd / T
 
     ## Begin computing tendencies
-    dP_dt = -1.0 * rho_air * c.g * V
+    dP_dt = 0.0 # assume contrail formation is isenthalpic and occurs at a fixed altitude (and total atmospheric pressure)
     dwc_dt = 0.0
-    # drs_dt = np.empty(shape=(nr), dtype=DTYPE)
+
     drs_dt = np.empty_like(rs)
+    dNis_dt = np.empty_like(Nis)
+
+    ## Set boundary conditions for the contrail mixing process using the labile parameter "V". Temperature of exhaust (T_e, in Kelvin) and ambient air (T_a, in Kelvin) and total atmospheric pressure (P0, in Pa)
+    T_e = V[4] 
+    T_a = V[0]
+    P0 = V[1]
+
+    ## Define parameters used to describe contrail dilution using one of two methods:
+
+    ## (1) according to B Kärcher et al., 2015
+    tau_m = 10e-3 # timescale over which contrail mixing is unaffected by entrainment, in seconds
+    beta = 0.9 # plume dilution parameter
+
+    ## (2) according to U Schumann et al., 1998 (used in Schuman et al., 2012)
+    ## tau_m = 10 ** (np.log10((70/7000))/0.8)
+    ## beta = 0.8
+    
+    expansion_time = tau_m * ((T_e - T_a) / (T - T_a)) ** (1/beta) 
+    
+    if expansion_time > tau_m:
+        dilution_parameter = (tau_m/expansion_time) ** beta
+    else:
+        dilution_parameter = 1
+    
+    dT_dt = - beta * (T_e - T_a)/tau_m * dilution_parameter ** (1 + 1/beta) # rate of change of plume temperature, in Kelvin
 
     for i in nb.prange(nr):
         r = rs[i]
@@ -147,70 +188,179 @@ def parcel_ode_sys(y, t, nr, r_drys, Nis, V, kappas, accom):
         kappa = kappas[i]
         Ni = Nis[i]
 
-        ## Non-continuum diffusivity/thermal conductivity of air near
-        ## near particle
+        ## Reduce number concentration within a given bin according to the chosen dilution parameter (see above), discriminating between the dilution of exhaust emissions and entrainment of ambient particles
+        if kappa == 0.500001: # method to discriminate between ambient particles and aircraft emissions (to update)
+            Ni = T_a/T * (1 - dilution_parameter) * Nis[i]
+        else:
+            Ni = dilution_parameter * (rho_air_dry)/((P0 * 28.96e-3) / (8.3145 * T_e)) * Nis[i] 
+
+        Ni = max(Ni, 0) # prevent negative bin concentrations
+
+        ## Non-continuum diffusivity/thermal conductivity of air near particle
         dv_r = dv(T, r, P, accom)
         ka_r = ka(T, r, rho_air)
 
-        ## Condensation coefficient
-        G_a = (c.rho_w * c.R * T) / (pv_sat * dv_r * c.Mw)
-        G_b = (c.L * c.rho_w * ((c.L * c.Mw / (c.R * T)) - 1.0)) / (ka_r * T)
-        G = 1.0 / (G_a + G_b)
+        ## Determine conditions for a droplet to nucleate ice homogeneously
+    
+        def J_Koop_new(T, r, kappa, r_dry):
+            """Calculates the homogeneous freezing rate for a given temperature, wet and dry droplet radius, and kappa value. This approach parameterizes the water activity according to kappa-Köhler theory
+            (Petters and Kreidenweis, 2007) and uses this in combination with the parameterization for homogeneous ice nucleation proposed by T Koop et al., 2000. I have also introduced a modified water 
+            activity using the results in C Marcolli, 2020, that result in a reduced freezing temperature for nanodroplets. The overall approach has previously been used by D Lewellen, 2020.
+ 
+            Parameters
+            ----------
+            T : float
+                Plume temperature, in Kelvin
+            r : float
+                Wet particle radii, in m
+            kappa : float
+                Particle hygroscopicity, no units
+            r_dry : float
+                Dry particle radii, in m
 
-        ## Difference between ambient and particle equilibrium supersaturation
-        Seq_r = Seq(r, r_dry, T, kappa)
-        delta_S = S - Seq_r
+            Returns
+            -------
+            x : J
+                Homogeneous freezing rate, in units of: ice nucleation events per unit volume per unit time
 
-        ## Size and liquid water tendencies
-        dr_dt = (G / r) * delta_S
-        dwc_dt += (
-            Ni * r * r * dr_dt
-        )  # Contribution to liq. water tendency due to growth
-        drs_dt[i] = dr_dt
+            """   
+            ## Parameterize the surface tension
+            T_c = 647.096
+            tau = 1 - T/T_c
+            mu = 1.256
+            B_ = 0.2358
+            b_ = -0.625
 
-    dwc_dt *= 4.0 * PI * c.rho_w / rho_air_dry  # Hydrated aerosol size -> water mass
-    # use rho_air_dry for mixing ratio definition consistency
-    # No freezing implemented yet
+            gamma_vw = B_ * tau ** mu * (1 + b_ * tau)
+
+            ## Specify the input conditions
+            r_w = r
+            T = T
+            P0 = 1e5/1e6 # 101325 ~ 1e5 normalised by 1e6 (for MPa)
+            P_droplet = (P0 + (2 * gamma_vw / r_w)/1e6) / 1e3 # converting to GPa
+            
+            ## Apply the homogeneous freezing rate parameterization
+            a_w = (r ** 3 - r_dry ** 3)/(r **3 - r_dry ** 3 * (1-kappa))
+
+            u_w_i_minus_u_w_0 = 210368 + 131.438 * T - 3.32373e6/T - 41729.1 * np.log(T)
+            a_w_i = np.exp(u_w_i_minus_u_w_0/(8.3145 * T))
+
+            v_w_0 = -230.76 - 0.1478 * T + 4099.2/T + 48.8341 * np.log(T)
+            v_i_0 = 19.43 - 2.2e-3 * T + 1.08e-5 * T ** 2
+
+            v_w_minus_v_i = v_w_0 * (P_droplet - 0.5 * 1.6 * P_droplet ** 2 - 1/6 * -8.8 * P_droplet ** 3) - v_i_0 * (P_droplet - 0.5 * 0.22 * P_droplet ** 2 - 1/6 * -0.17 * P_droplet **3)
+
+            delta_a_w = a_w * np.exp(v_w_minus_v_i/(8.3145 * T)) - a_w_i
+
+            J = 10 ** (-906.7 + 8502 * delta_a_w - 26924 * delta_a_w ** 2 + 29180 * delta_a_w ** 3)
+            
+            # if delta_a_w > 0.34 or delta_a_w < 0.26:
+            #     return np.nan
+
+            return J
+
+        def frozen_fraction(T, r_dry, r_wet, kappa, dT_dt):
+            """Estimates the fraction of droplets frozen under a given set of conditions. This approach is taken from B Kärcher et al., 2015. 
+ 
+            Parameters
+            ----------
+            T : float
+                Plume temperature, in Kelvin
+            r_dry : float
+                dry particle radii, in m
+            r_wet : float
+                Wet particle radii, in m                
+            kappa : float
+                Particle hygroscopicity, no units
+            dT_dt: float
+                Instantaneous cooling rate, in K/s
+
+            Returns
+            -------
+            lmbda : fraction frozen, in arbitrary units.
+
+            """   
+            J = J_Koop_new(T, r_wet, kappa, r_dry) * 1e6
+
+            ## Determine rate of change of the homogeneous ice nucleation rate (dJ_dT)
+            dT = 0.001
+            dJ_dT = (np.log(J_Koop_new(T + dT, r_wet, kappa, r_dry)) - np.log(J_Koop_new(T, r_wet, kappa, r_dry)))/(2 * dT) 
+            inverse_freezing_timescale = dJ_dT * dT_dt
+            
+            ## Determine the frozen fraction via the liquid water volume
+            volume_of_dry_particle = 4/3 * np.pi * r_dry ** 3 # volume of dry particle without the soluble material included
+            volume_of_wet_particle = 4/3 * np.pi * r_wet ** 3 # volume of wet particle including water added during hygroscopic growth
+            LWV = volume_of_wet_particle - volume_of_dry_particle # total volume of metastable liquid (original coating + water)
+            lmbda = 1 - np.exp(-LWV * J * inverse_freezing_timescale) # determine the frozen fraction
+
+            return lmbda
+
+        ff = frozen_fraction(T, r_dry, r, kappa, dT_dt)
+
+        if ff >= 1:
+
+            ## Provided the droplet has frozen, determine the contribution of ice to dwc_dt. 
+            rho_i = 916.8 # density of ice, kg/m^3
+            Li = 3.335e5 # latent heat of freezing, J/kg
+
+            # Condensation coefficient
+            G_a = (rho_i * c.R * T) / (p_i_0(T) * dv_r * c.Mw)
+            G_b = (Li * rho_i * ((Li * c.Mw / (c.R * T)) - 1.0)) / (ka_r * T)
+            G = 1.0 / (G_a + G_b)
+
+            ## Converting water supersaturation to ice supersaturation according to Korolev and Mazin, 2003 (not necessary to correct for particle equilibrium saturation)
+            xi = es(T-273.15)/p_i_0(T) 
+            delta_S = xi * S + xi - 1
+
+            ## Size and liquid water tendencies
+            dr_dt = (G / r) * delta_S
+            dwc_dt += (
+                rho_i * Ni * r * r * dr_dt
+            )  # Contribution to liq. water tendency due to growth
+            drs_dt[i] = dr_dt
+    
+        else:
+
+            ## Provided the droplet has frozen, determine the contribution of liquid droplets to dwc_dt. 
+            # Condensation coefficient
+            G_a = (c.rho_w * c.R * T) / (pv_sat * dv_r * c.Mw)
+            G_b = (c.L * c.rho_w * ((c.L * c.Mw / (c.R * T)) - 1.0)) / (ka_r * T)
+            G = 1.0 / (G_a + G_b)
+
+            ## Difference between ambient and particle equilibrium supersaturation
+            Seq_r = Seq(r, r_dry, T, kappa)
+            delta_S = S - Seq_r
+
+            ## Size and liquid water tendencies
+            dr_dt = (G / r) * delta_S
+            dwc_dt += (
+                c.rho_w * Ni * r * r * dr_dt
+            )  # Contribution to liq. water tendency due to growth
+            drs_dt[i] = dr_dt
+            # dNis_dt[i] = dN_dt
+        
+    dwc_dt *= 4.0 * PI / rho_air_dry  # Hydrated aerosol size -> water mass
     dwi_dt = 0.0
 
     ## MASS BALANCE CONSTRAINT
-    dwv_dt = -1.0 * (dwc_dt + dwi_dt)
-
-    ## ADIABATIC COOLING
-    dT_dt = -c.g * V / c.Cp - c.L * dwv_dt / c.Cp
-
-    dz_dt = V
-
-    """ Alternative methods for calculation supersaturation tendency
-    # Used eq 12.28 from Pruppacher and Klett in stead of (9) from Nenes et al, 2001
-    #cdef double S_a, S_b, S_c, dS_dt
-    #cdef double S_b_old, S_c_old, dS_dt_old
-    #S_a = (S+1.0)
-
-    ## NENES (2001)
-    #S_b_old = dT_dt*wv_sat*(17.67*243.5)/((243.5+(Tv-273.15))**2.)
-    #S_c_old = (rho_air*g*V)*(wv_sat/P)*((0.622*L)/(Cp*Tv) - 1.0)
-    #dS_dt_old = (1./wv_sat)*(dwv_dt - S_a*(S_b_old-S_c_old))
-
-    ## PRUPPACHER (PK 1997)
-    #S_b = dT_dt*0.622*L/(Rd*T**2.)
-    #S_c = g*V/(Rd*T)
-    #dS_dt = P*dwv_dt/(0.622*es(T-273.15)) - S_a*(S_b + S_c)
-
-    ## SEINFELD (SP 1998)
-    #S_b = L*Mw*dT_dt/(R*T**2.)
-    #S_c = V*g*Ma/(R*T)
-    #dS_dt = dwv_dt*(Ma*P)/(Mw*es(T-273.15)) - S_a*(S_b + S_c)
-    """
+    dwv_dt = -1.0 * dwc_dt 
+    dz_dt = 0  
 
     ## GHAN (2011)
-    alpha = (c.g * c.Mw * c.L) / (c.Cp * c.R * (T**2))
-    alpha -= (c.g * c.Ma) / (c.R * T)
-    gamma = (P * c.Ma) / (c.Mw * pv_sat)
-    gamma += (c.Mw * c.L * c.L) / (c.Cp * c.R * T * T)
-    dS_dt = alpha * V - gamma * dwc_dt
 
-    # x = np.empty(shape=(nr+N_STATE_VARS), dtype='d')
+    ## Redefining "alpha" (the generation of supersaturation) according to B Kärcher et al., 2015.
+
+    def Smw(T): # dS/dT along the contrail mixing plume
+        return (p_i_0(T_a) * V[2] + V[3] * (T - T_a))/es(T-273.15)
+
+    dT = 1e-10
+    alpha = (Smw(T + dT) - Smw(T - dT))/(2 * dT) * dT_dt
+
+    ## Using the preexisting "gamma" function
+
+    gamma = (P * c.Ma) / (c.Mw * pv_sat)
+    dS_dt = alpha - gamma * dwc_dt
+
     x = np.empty_like(y)
     x[0] = dz_dt
     x[1] = dP_dt
@@ -219,6 +369,6 @@ def parcel_ode_sys(y, t, nr, r_drys, Nis, V, kappas, accom):
     x[4] = dwc_dt
     x[5] = dwi_dt
     x[6] = dS_dt
-    x[N_STATE_VARS:] = drs_dt[:]
+    x[N_STATE_VARS:N_STATE_VARS+nr] = drs_dt[:]
 
     return x

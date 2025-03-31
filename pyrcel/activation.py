@@ -76,7 +76,7 @@ def lognormal_activation(smax, mu, sigma, N, kappa, sgi=None, T=None, approx=Tru
     return N_act, act_frac
 
 
-def binned_activation(Smax, T, rs, aerosol, approx=False):
+def binned_activation(Smax, T, rs, aerosol, T_a, P0, T_e, approx=False):
     """Compute the activation statistics of a given aerosol, its transient
     size distribution, and updraft characteristics. Following Nenes et al, 2001
     also compute the kinetic limitation statistics for the aerosol.
@@ -86,75 +86,192 @@ def binned_activation(Smax, T, rs, aerosol, approx=False):
     Smax : float
         Environmental maximum supersaturation.
     T : float
-        Environmental temperature.
+        Plume temperature, in Kelvin.
     rs : array of floats
         Wet radii of aerosol/droplet population.
     aerosol : :class:`AerosolSpecies`
         The characterization of the dry aerosol.
+    T_a : float
+        The ambient temperature, in Kelvin.
+    P0 : float
+        The total atmospheric pressure temperature, in Pa.
+    T_e : float
+        The exhaust temperature, in Kelvin.
     approx : boolean
         Approximate Kohler theory rather than include detailed calculation (default False)
 
     Returns
     -------
-    eq, kn: floats
-        Activated fractions
-    alpha : float
-        N_kn / N_eq
-    phi : float
-        N_unact / N_kn
+    EI : floats:
+        The emission index of ice, in particles per kg of fuel burned. 
 
     """
     kappa = aerosol.kappa
     r_drys = aerosol.r_drys
     Nis = aerosol.Nis
-    N_tot = np.sum(Nis)
 
-    # Coerce the reference wet droplet sizes (rs) to an array if they were passed as
-    # a Series
+    def es(T):
+        """See :func:`pyrcel.thermo.es` for full documentation"""
+        return 611.2 * np.exp(17.67 * T / (T + 243.5))
+
+    pv_sat = es(T - 273.15)  # saturation vapor pressure
+    e = (1.0 + Smax) * pv_sat  # water vapor pressure
+    rho_air_dry = (P0 - e) / c.Rd / T # density of dry air, in kg/m^3
+
+    ## Define parameters used to describe contrail dilution using one of two methods:
+
+    ## (1) according to B Kärcher et al., 2015
+    tau_m = 10e-3 # timescale over which contrail mixing is unaffected by entrainment, in seconds
+    beta = 0.9 # plume dilution parameter
+
+    ## (2) according to U Schumann et al., 1998 (used in Schuman et al., 2012)
+    ## tau_m = 10 ** (np.log10((70/7000))/0.8)
+    ## beta = 0.8
+    
+    expansion_time = tau_m * ((T_e - T_a) / (T - T_a)) ** (1/beta)
+    dilution_parameter = np.where(expansion_time > tau_m, (tau_m/expansion_time) ** beta, 1) # dilution parameter as a function of expansion time
+
+    if kappa == 0.500001:
+        Nis = T_a/T * (1 - dilution_parameter) * aerosol.Nis
+    else:
+        Nis = dilution_parameter * (rho_air_dry)/((P0 * 28.96e-3) / (8.3145 * T_e)) * aerosol.Nis # dilution of number concentration
+
+    dT_dt = - beta * (T_e - T_a)/tau_m * dilution_parameter ** (1 + 1/beta)
+
+    ## Determine conditions for a droplet to nucleate ice homogeneously
+    
+    def J_Koop_new(T, r, kappa, r_dry):
+        """Calculates the homogeneous freezing rate for a given temperature, wet and dry droplet radius, and kappa value. This approach parameterizes the water activity according to kappa-Köhler theory
+        (Petters and Kreidenweis, 2007) and uses this in combination with the parameterization for homogeneous ice nucleation proposed by T Koop et al., 2000. I have also introduced a modified water 
+        activity using the results in C Marcolli, 2020, that result in a reduced freezing temperature for nanodroplets. The overall approach has previously been used by D Lewellen, 2020.
+
+        Parameters
+        ----------
+        T : float
+            Plume temperature, in Kelvin
+        r : float
+            Wet particle radii, in m
+        kappa : float
+            Particle hygroscopicity, no units
+        r_dry : float
+            Dry particle radii, in m
+
+        Returns
+        -------
+        x : J
+            Homogeneous freezing rate, in units of: ice nucleation events per unit volume per unit time
+
+        """   
+        ## Parameterize the surface tension
+        T_c = 647.096
+        tau = 1 - T/T_c
+        mu = 1.256
+        B_ = 0.2358
+        b_ = -0.625
+
+        gamma_vw = B_ * tau ** mu * (1 + b_ * tau)
+
+        ## Specify the input conditions
+        r_w = r
+        T = T
+        P0 = 1e5/1e6 # 101325 ~ 1e5 normalised by 1e6 (for MPa)
+        P_droplet = (P0 + (2 * gamma_vw / r_w)/1e6) / 1e3 # converting to GPa
+        
+        ## Apply the homogeneous freezing rate parameterization
+        a_w = (r ** 3 - r_dry ** 3)/(r **3 - r_dry ** 3 * (1-kappa))
+
+        u_w_i_minus_u_w_0 = 210368 + 131.438 * T - 3.32373e6/T - 41729.1 * np.log(T)
+        a_w_i = np.exp(u_w_i_minus_u_w_0/(8.3145 * T))
+
+        v_w_0 = -230.76 - 0.1478 * T + 4099.2/T + 48.8341 * np.log(T)
+        v_i_0 = 19.43 - 2.2e-3 * T + 1.08e-5 * T ** 2
+
+        v_w_minus_v_i = v_w_0 * (P_droplet - 0.5 * 1.6 * P_droplet ** 2 - 1/6 * -8.8 * P_droplet ** 3) - v_i_0 * (P_droplet - 0.5 * 0.22 * P_droplet ** 2 - 1/6 * -0.17 * P_droplet **3)
+
+        delta_a_w = a_w * np.exp(v_w_minus_v_i/(8.3145 * T)) - a_w_i
+
+        J = 10 ** (-906.7 + 8502 * delta_a_w - 26924 * delta_a_w ** 2 + 29180 * delta_a_w ** 3)
+        
+        # if delta_a_w > 0.34 or delta_a_w < 0.26:
+        #     return np.nan
+
+        return J
+   
+    def frozen_fraction(T, r_dry, r_wet, kappa, dT_dt):
+        """Estimates the fraction of droplets frozen under a given set of conditions. This approach is taken from B Kärcher et al., 2015. 
+
+        Parameters
+        ----------
+        T : float
+            Plume temperature, in Kelvin
+        r_dry : float
+            dry particle radii, in m
+        r_wet : float
+            Wet particle radii, in m                
+        kappa : float
+            Particle hygroscopicity, no units
+        dT_dt: float
+            Instantaneous cooling rate, in K/s
+
+        Returns
+        -------
+        lmbda : fraction frozen, in arbitrary units.
+
+        """   
+        J = J_Koop_new(T, r_wet, kappa, r_dry) * 1e6
+
+        ## Determine rate of change of the homogeneous ice nucleation rate (dJ_dT)
+        dT = 0.001
+        dJ_dT = (np.log(J_Koop_new(T + dT, r_wet, kappa, r_dry)) - np.log(J_Koop_new(T, r_wet, kappa, r_dry)))/(2 * dT) 
+        inverse_freezing_timescale = dJ_dT * dT_dt
+        
+        ## Determine the frozen fraction via the liquid water volume
+        volume_of_dry_particle = 4/3 * np.pi * r_dry ** 3 # volume of dry particle without the soluble material included
+        volume_of_wet_particle = 4/3 * np.pi * r_wet ** 3 # volume of wet particle including water added during hygroscopic growth
+        LWV = volume_of_wet_particle - volume_of_dry_particle # total volume of metastable liquid (original coating + water)
+        lmbda = 1 - np.exp(-LWV * J * inverse_freezing_timescale) # determine the frozen fraction
+
+        return lmbda
+    
+    ## Identify the frozen fraction for each of the bins
+    ff = frozen_fraction(T, r_drys, rs, kappa, dT_dt)
+    ff = ff.fillna(0.0) # replace nan values with 0.0
+    ff = np.round(ff, decimals = 3)
+    
+    # Coerce the reference wet droplet sizes (rs) to an array if they were passed as a Series
     if hasattr(rs, "values"):
         rs = rs.values
 
     r_crits, s_crits = list(
-        zip(*[kohler_crit(T, r_dry, kappa, approx) for r_dry in r_drys])
+        zip(*[kohler_crit(T, r_dry, kappa, False) for r_dry in r_drys])
     )
     s_crits = np.array(s_crits)
     r_crits = np.array(r_crits)
 
-    # Equilibrium calculation - all aerosol whose critical supersaturation is
-    #                           less than the environmental supersaturation
-    activated_eq = Smax >= s_crits
-    N_eq = np.sum(Nis[activated_eq])
-    eq_frac = N_eq / N_tot
+    ## Equilibrium calculation - all aerosol whose critical supersaturation > environmental supersaturation 
+    aerosol_eq = (rs < r_crits) & (ff < 1) 
 
-    # Kinetic calculation - find the aerosol with the smallest dry radius which has
-    #                       grown past its critical radius, and count this aerosol and
-    #                       all larger ones as activated. This will include some large
-    #                       particles which haven't grown to critical size yet.
-    is_r_large = rs >= r_crits
-    if not np.any(is_r_large):
-        N_kn, kn_frac = 0.0, 0.0
-        phi = 1.0
-    else:
-        smallest_ind = np.where(is_r_large)[0][0]
-        N_kn = np.sum(Nis[smallest_ind:])
-        kn_frac = N_kn / N_tot
+    ## Equilibrium water calculation - all aerosol whose critical supersaturation is less than the environmental supersaturation and whose T_hom < T (water droplets)
+    activated_eq = (rs >= r_crits) & (ff < 1)
 
-        # Unactivated - all droplets smaller than their critical size
-        droplets = list(range(smallest_ind, len(Nis)))
-        Nis_drops = Nis[droplets]
-        r_crits_drops = r_crits[droplets]
-        rs_drops = rs[droplets]
-        too_small = rs_drops < r_crits_drops
+    ## Equilibrium ice calculation - all aerosol whose critical supersaturation is less than the environmental supersaturation and whose T_hom > T (ice crystals)
+    frozen_eq = (ff >= 1) 
 
-        N_unact = np.sum(Nis_drops[too_small])
+    ## Identify the bin radii and associated number concentration of non-activated aerosol particles, water droplets and ice crystals
+    aerosol_mode_conc = Nis[aerosol_eq]
+    aerosol_mode_radius = rs[aerosol_eq]
 
-        phi = N_unact / N_kn
+    ice_mode_conc = Nis[frozen_eq]
+    ice_mode_radius = rs[frozen_eq]
+    
+    liquid_mode_conc = Nis[activated_eq]
+    liquid_mode_radius = rs[activated_eq]
 
-    alpha = N_kn / N_eq
-
-    return eq_frac, kn_frac, alpha, phi
-
-
+    ## Determine the effective emission index of ice
+    EIi_eq = (np.sum(ice_mode_conc) * 60) / (dilution_parameter * rho_air_dry) # parameterization for emission index is taken from B Kärcher et al., 2015.
+           
+    return EIi_eq
+    
 # noinspection PyUnresolvedReferences
 def multi_mode_activation(Smax, T, aerosols, rss):
     """Compute the activation statistics of a multi-mode, binned_activation
