@@ -254,10 +254,10 @@ def parcel_ode_sys(y, t, nr, r_drys, Nis, V, kappas, accom):
 
             J = 10 ** (-906.7 + 8502 * delta_a_w - 26924 * delta_a_w ** 2 + 29180 * delta_a_w ** 3)
             
-            # if delta_a_w > 0.34 or delta_a_w < 0.26:
-            #     return np.nan
-
-            return J
+            if delta_a_w > 0.34 or delta_a_w < 0.26: # constraint placed in T Koop et al., 2000
+                return np.nan
+            else:
+                return J
 
         def frozen_fraction(T, r_dry, r_wet, kappa, dT_dt):
             """Estimates the fraction of droplets frozen under a given set of conditions. This approach is taken from B Kärcher et al., 2015. 

@@ -191,11 +191,8 @@ def binned_activation(Smax, T, rs, aerosol, T_a, P0, T_e, approx=False):
         delta_a_w = a_w * np.exp(v_w_minus_v_i/(8.3145 * T)) - a_w_i
 
         J = 10 ** (-906.7 + 8502 * delta_a_w - 26924 * delta_a_w ** 2 + 29180 * delta_a_w ** 3)
-        
-        # if delta_a_w > 0.34 or delta_a_w < 0.26:
-        #     return np.nan
 
-        return J
+        return np.where((delta_a_w > 0.34) | (delta_a_w < 0.26), np.nan, J) # constraint placed in T Koop et al., 2000
    
     def frozen_fraction(T, r_dry, r_wet, kappa, dT_dt):
         """Estimates the fraction of droplets frozen under a given set of conditions. This approach is taken from B Kärcher et al., 2015. 
